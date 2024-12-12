@@ -162,7 +162,8 @@ def process_tile(img_path: str,
             totalpix = out_img.shape[1] * out_img.shape[2]
 
             # If the tile is mostly empty or mostly nan, don't save it
-            if sumzero > nan_threshold * totalpix or sumnan > nan_threshold * totalpix:
+            if sumzero > nan_threshold * totalpix or sumnan > nan_threshold * totalpix or np.isnan(
+                    out_sumbands).sum() > nan_threshold * totalpix:
                 return None
 
             out_meta = data.meta.copy()
@@ -186,7 +187,7 @@ def process_tile(img_path: str,
                 rgb = np.dstack((b, g, r))  # Reorder for cv2 (BGRA)
 
                 # Rescale to 0-255 if necessary
-                if np.max(g) > 255:
+                if np.nanmax(g) > 255:
                     rgb_rescaled = 255 * rgb / 65535
                 else:
                     rgb_rescaled = rgb
