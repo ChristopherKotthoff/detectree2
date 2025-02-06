@@ -5,16 +5,19 @@ of models and making landscape predictions.
 """
 
 import concurrent.futures
+import glob
 import json
 import logging
 import math
 import os
 import pickle
 import random
+import re
 import shutil
 import warnings  # noqa: F401
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Union
 
 import cv2
 import geopandas as gpd
@@ -33,6 +36,27 @@ from tqdm.auto import tqdm
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# Getting rid of unnecessary and confusing errors and warnings
+class GDALFilter(logging.Filter):
+
+    def filter(self, record):
+        return "GDAL signalled an error: err_no=4, msg='" not in record.getMessage()
+
+
+rasterlogger = logging.getLogger("rasterio._env")
+rasterlogger.addFilter(GDALFilter())
+
+
+class PyogrioFilter(logging.Filter):
+
+    def filter(self, record):
+        return "Created " not in record.getMessage()
+
+
+pyogriologger = logging.getLogger("pyogrio._io")
+pyogriologger.addFilter(PyogrioFilter())
 
 # class img_data(DatasetReader):
 #    """
@@ -97,7 +121,9 @@ def process_tile(img_path: str,
                  nan_threshold: float = 0,
                  mask_gdf: gpd.GeoDataFrame = None,
                  additional_nodata: List[Any] = [],
-                 image_statistics: List[Dict[str, float]] = None):
+                 image_statistics: List[Dict[str, float]] = None,
+                 ignore_bands_indices: List[int] = [],
+                 use_convex_mask: bool = True):
     """Process a single tile for making predictions.
 
     Args:
@@ -143,8 +169,9 @@ def process_tile(img_path: str,
             else:
                 nodata = 0
 
-            out_img, out_transform = mask(data, shapes=coords, nodata=nodata, crop=True)
+            out_img, out_transform = mask(data, shapes=coords, nodata=nodata, crop=True, indexes=[1, 2, 3])
 
+            mask_tif = None
             if mask_gdf is not None:
                 #if mask_gdf.crs != data.crs:
                 #    mask_gdf = mask_gdf.to_crs(data.crs) #TODO is this necessary?
@@ -154,24 +181,56 @@ def process_tile(img_path: str,
                                                            invert=True,
                                                            out_shape=(out_img.shape[1], out_img.shape[2]))
 
-                out_img[:, ~mask_tif] = nodata
+            convex_mask_tif = None
+            if use_convex_mask and crowns is not None:
+                # Create a convex mask around the crown polygons
+                if gpd.__version__.startswith("1."):
+                    unioned_crowns = overlapping_crowns.union_all()
+                else:
+                    unioned_crowns = overlapping_crowns.unary_union
+                convex_mask_tif = rasterio.features.geometry_mask([unioned_crowns.convex_hull.buffer(5)],
+                                                                  transform=out_transform,
+                                                                  invert=True,
+                                                                  out_shape=(out_img.shape[1], out_img.shape[2]))
 
             out_sumbands = np.sum(out_img, axis=0)
             zero_mask = np.where(out_sumbands == 0, 1, 0)
-            nan_mask = np.where(out_sumbands == 765, 1, 0)
+            nan_mask = np.isnan(out_sumbands) | np.where(out_sumbands == 765, 1, 0) | np.where(
+                out_sumbands == 65535 * 3, 1, 0)
             for nodata_val in additional_nodata:
                 nan_mask = nan_mask | np.where(out_sumbands == nodata_val, 1, 0)
-            sumzero = zero_mask.sum()
-            sumnan = nan_mask.sum()
+            if mask_tif is not None:
+                nan_mask = nan_mask | ~mask_tif
+            if convex_mask_tif is not None:
+                nan_mask = nan_mask | ~convex_mask_tif
             totalpix = out_img.shape[1] * out_img.shape[2]
 
             # If the tile is mostly empty or mostly nan, don't save it
-            if sumzero > nan_threshold * totalpix or sumnan > nan_threshold * totalpix or np.isnan(
-                    out_sumbands).sum() > nan_threshold * totalpix:
+            invalid = (zero_mask | nan_mask).sum()
+            if invalid > nan_threshold * totalpix:
+                logger.warning(
+                    f"Skipping tile at ({minx}, {miny}) due to being over nodata threshold. Threshold: {nan_threshold}, nodata ration: {invalid / totalpix}"
+                )
                 return None
 
             # Apply nan mask
-            out_img[np.broadcast_to((nan_mask == 1)[None, :, :], out_img.shape)] = nodata
+            out_img[np.broadcast_to((nan_mask == 1)[None, :, :], out_img.shape)] = 0
+
+            dtype_map = {
+                np.dtype(np.uint8): ("uint8", 0),
+                np.dtype(np.uint16): ("uint16", 0),
+                np.dtype(np.uint32): ("uint32", 0),
+                np.dtype(np.int8): ("int8", 0),
+                np.dtype(np.int16): ("int16", 0),
+                np.dtype(np.int32): ("int32", 0),
+                np.dtype(np.float16): ("float16", 0.0),
+                np.dtype(np.float32): ("float32", 0.0),
+                np.dtype(np.float64): ("float64", 0.0),
+            }
+
+            dtype, nodata = dtype_map.get(out_img.dtype, (None, None))
+            if dtype is None:
+                logger.exception(f"Unsupported dtype: {out_img.dtype}")
 
             out_meta = data.meta.copy()
             out_meta.update({
@@ -179,27 +238,27 @@ def process_tile(img_path: str,
                 "height": out_img.shape[1],
                 "width": out_img.shape[2],
                 "transform": out_transform,
+                "count": 3,
                 "nodata": nodata,
+                "dtype": dtype,
             })
-            if dtype_bool:
-                out_meta.update({"dtype": "uint8"})
 
             out_tif = out_path_root.with_suffix(".tif")
             with rasterio.open(out_tif, "w", **out_meta) as dest:
                 dest.write(out_img)
 
-            with rasterio.open(out_tif) as clipped:
-                arr = clipped.read()
-                r, g, b = arr[0], arr[1], arr[2]
-                rgb = np.dstack((b, g, r))  # Reorder for cv2 (BGRA)
+            r, g, b = out_img[0], out_img[1], out_img[2]
+            rgb = np.dstack((b, g, r))  # Reorder for cv2 (BGRA)
 
-                # Rescale to 0-255 if necessary
-                if np.nanmax(g) > 255:
-                    rgb_rescaled = 255 * rgb / 65535
-                else:
-                    rgb_rescaled = rgb
+            # Rescale to 0-255 if necessary
+            if np.nanmax(g) > 255:
+                rgb_rescaled = rgb / 65535 * 255
+            else:
+                rgb_rescaled = rgb
 
-                cv2.imwrite(str(out_path_root.with_suffix(".png").resolve()), rgb_rescaled)
+            np.clip(rgb_rescaled, 0, 255, out=rgb_rescaled)
+
+            cv2.imwrite(str(out_path_root.with_suffix(".png").resolve()), rgb_rescaled.astype(np.uint8))
 
             if overlapping_crowns is not None:
                 return data, out_path_root, overlapping_crowns, minx, miny, buffer
@@ -211,6 +270,10 @@ def process_tile(img_path: str,
         return None
     except Exception as e:
         logger.error(f"Error processing tile {tilename} at ({minx}, {miny}): {e}")
+        #print stacktrace
+        #import traceback
+        #traceback.print_exc()
+
         return None
 
 
@@ -227,8 +290,11 @@ def process_tile_ms(img_path: str,
                     crowns: gpd.GeoDataFrame = None,
                     threshold: float = 0,
                     nan_threshold: float = 0,
+                    mask_gdf: gpd.GeoDataFrame = None,
                     additional_nodata: List[Any] = [],
-                    image_statistics: List[Dict[str, float]] = None):
+                    image_statistics: List[Dict[str, float]] = None,
+                    ignore_bands_indices: List[int] = [],
+                    use_convex_mask: bool = True):
     """Process a single tile for making predictions.
 
     Args:
@@ -259,32 +325,63 @@ def process_tile_ms(img_path: str,
             bbox = box(minx_buffered, miny_buffered, maxx_buffered, maxy_buffered)
             geo = gpd.GeoDataFrame({"geometry": [bbox]}, index=[0], crs=data.crs)
             coords = [geo.geometry[0].__geo_interface__]
-
             if crowns is not None:
                 overlapping_crowns = gpd.clip(crowns, geo)
+                if mask_gdf is not None:
+                    overlapping_crowns = gpd.clip(overlapping_crowns, mask_gdf)
                 if overlapping_crowns.empty or (overlapping_crowns.dissolve().area[0] / geo.area[0]) < threshold:
                     return None
             else:
                 overlapping_crowns = None
-
             if data.nodata is not None:
                 nodata = data.nodata
             else:
                 nodata = 0
 
-            out_img, out_transform = mask(data, shapes=coords, nodata=nodata, crop=True)
+            bands_to_read = [
+                i for i in list(range(1, data.count + 1)) if i not in [i + 1 for i in ignore_bands_indices]
+            ]
+            out_img, out_transform = mask(data, shapes=coords, nodata=nodata, crop=True, indexes=bands_to_read)
+
+            mask_tif = None
+            if mask_gdf is not None:
+                #if mask_gdf.crs != data.crs:
+                #    mask_gdf = mask_gdf.to_crs(data.crs) #TODO is this necessary?
+
+                mask_tif = rasterio.features.geometry_mask([geom for geom in mask_gdf.geometry],
+                                                           transform=out_transform,
+                                                           invert=True,
+                                                           out_shape=(out_img.shape[1], out_img.shape[2]))
+
+            convex_mask_tif = None
+            if use_convex_mask and crowns is not None:
+                # Create a convex mask around the crown polygons
+                if gpd.__version__.startswith("1."):
+                    unioned_crowns = overlapping_crowns.union_all()
+                else:
+                    unioned_crowns = overlapping_crowns.unary_union
+                convex_mask_tif = rasterio.features.geometry_mask([unioned_crowns.convex_hull.buffer(5)],
+                                                                  transform=out_transform,
+                                                                  invert=True,
+                                                                  out_shape=(out_img.shape[1], out_img.shape[2]))
 
             out_sumbands = np.sum(out_img, axis=0)
             zero_mask = np.where(out_sumbands == 0, 1, 0)
-            nan_mask = np.isnan(out_sumbands)
+            nan_mask = np.isnan(out_sumbands) | np.where(out_sumbands == 65535 * len(bands_to_read), 1, 0)
             for nodata_val in additional_nodata:
                 nan_mask = nan_mask | np.where(out_sumbands == nodata_val, 1, 0)
-            sumzero = zero_mask.sum()
-            sumnan = nan_mask.sum()
+            if mask_tif is not None:
+                nan_mask = nan_mask | ~mask_tif
+            if convex_mask_tif is not None:
+                nan_mask = nan_mask | ~convex_mask_tif
             totalpix = out_img.shape[1] * out_img.shape[2]
 
             # If the tile is mostly empty or mostly nan, don't save it
-            if sumzero > nan_threshold * totalpix or sumnan > nan_threshold * totalpix:
+            invalid = (zero_mask | nan_mask).sum()
+            if invalid > nan_threshold * totalpix:
+                logger.warning(
+                    f"Skipping tile at ({minx}, {miny}) due to being over nodata threshold. Threshold: {nan_threshold}, nodata ration: {invalid / totalpix}"
+                )
                 return None
 
             # rescale image to 1-255 (0 is reserved for nodata)
@@ -299,10 +396,26 @@ def process_tile_ms(img_path: str,
                 out_img = (out_img - min_vals) * 254 / (max_vals - min_vals) + 1
 
             # additional clip to make sure
-            out_img = np.clip(out_img, 1, 255)
+            out_img = np.clip(out_img.astype(np.float32), 1.0, 255.0)
 
             # Apply nan mask
-            out_img[np.broadcast_to((nan_mask == 1)[None, :, :], out_img.shape)] = 0
+            out_img[np.broadcast_to((nan_mask == 1)[None, :, :], out_img.shape)] = 0.0
+
+            dtype_map = {
+                np.dtype(np.uint8): ("uint8", 0),
+                np.dtype(np.uint16): ("uint16", 0),
+                np.dtype(np.uint32): ("uint32", 0),
+                np.dtype(np.int8): ("int8", 0),
+                np.dtype(np.int16): ("int16", 0),
+                np.dtype(np.int32): ("int32", 0),
+                np.dtype(np.float16): ("float16", 0.0),
+                np.dtype(np.float32): ("float32", 0.0),
+                np.dtype(np.float64): ("float64", 0.0),
+            }
+
+            dtype, nodata = dtype_map.get(out_img.dtype, (None, None))
+            if dtype is None:
+                logger.exception(f"Unsupported dtype: {out_img.dtype}")
 
             out_meta = data.meta.copy()
             out_meta.update({
@@ -310,16 +423,21 @@ def process_tile_ms(img_path: str,
                 "height": out_img.shape[1],
                 "width": out_img.shape[2],
                 "transform": out_transform,
-                "nodata": 0,
+                "count": out_img.shape[0],
+                "nodata": nodata,
+                "dtype": dtype
             })
-            if dtype_bool:
-                raise NotImplementedError(
-                    "dtype_bool not implemented for multispectral data. Pretty sure dtype_bool should be False.")
-                out_meta.update({"dtype": "uint8"})
 
             out_tif = out_path_root.with_suffix(".tif")
             with rasterio.open(out_tif, "w", **out_meta) as dest:
                 dest.write(out_img)
+
+            # with rasterio.open(out_tif) as clipped:
+            #     arr = clipped.read()
+            #     r, g, b = arr[0], arr[1], arr[2]
+            #     rgb = np.dstack((b, g, r))  # Reorder for cv2 (BGRA)
+
+            #     cv2.imwrite(str(out_path_root.with_suffix(".png").resolve()), rgb)
 
             if overlapping_crowns is not None:
                 return data, out_path_root, overlapping_crowns, minx, miny, buffer
@@ -352,7 +470,8 @@ def process_tile_train(
         class_column: str = None,  # Allow user to specify class column
         mask_gdf: gpd.GeoDataFrame = None,
         additional_nodata: List[Any] = [],
-        image_statistics: List[Dict[str, float]] = None) -> None:
+        image_statistics: List[Dict[str, float]] = None,
+        ignore_bands_indices: List[int] = []) -> None:
     """Process a single tile for training data.
 
     Args:
@@ -375,10 +494,12 @@ def process_tile_train(
     """
     if mode == "rgb":
         result = process_tile(img_path, out_dir, buffer, tile_width, tile_height, dtype_bool, minx, miny, crs, tilename,
-                              crowns, threshold, nan_threshold, mask_gdf, additional_nodata, image_statistics)
+                              crowns, threshold, nan_threshold, mask_gdf, additional_nodata, image_statistics,
+                              ignore_bands_indices)
     elif mode == "ms":
         result = process_tile_ms(img_path, out_dir, buffer, tile_width, tile_height, dtype_bool, minx, miny, crs,
-                                 tilename, crowns, threshold, nan_threshold, additional_nodata, image_statistics)
+                                 tilename, crowns, threshold, nan_threshold, mask_gdf, additional_nodata,
+                                 image_statistics, ignore_bands_indices)
 
     if result is None:
         # logger.warning(f"Skipping tile at ({minx}, {miny}) due to insufficient data.")
@@ -513,7 +634,12 @@ def _calculate_tile_placements(
     return coordinates
 
 
-def calculate_image_statistics(file_path, values_to_ignore=None, window_size=64, min_windows=100, mode="rgb"):
+def calculate_image_statistics(file_path,
+                               values_to_ignore=None,
+                               window_size=64,
+                               min_windows=100,
+                               mode="rgb",
+                               ignore_bands_indices: List[int] = []):
     """
     Calculate statistics for a raster using either whole image or sampled windows.
 
@@ -528,25 +654,29 @@ def calculate_image_statistics(file_path, values_to_ignore=None, window_size=64,
     """
     if values_to_ignore is None:
         values_to_ignore = []
+    values_to_ignore.append(65535)
     with rasterio.open(file_path) as src:
         # Get image dimensions
         width, height = src.width, src.height
 
-        # If the image is smaller than 2000x2000, process the whole image
-        if width * height <= 2000 * 2000:
-            print("Processing entire image...")
+        def calc_on_everything():
+            logger.info("Processing entire image...")
             band_stats = []
             for band_idx in range(1, src.count + 1):
+                if band_idx - 1 in ignore_bands_indices:
+                    continue
                 band = src.read(band_idx).astype(float)
                 # Mask out bad values
                 mask = (np.isnan(band) | np.isin(band, values_to_ignore))
                 valid_data = band[~mask]
 
                 if valid_data.size > 0:
+                    min_val, max_val = np.percentile(valid_data, [1, 99])
+
                     stats = {
                         "mean": np.mean(valid_data),
-                        "min": np.min(valid_data),
-                        "max": np.max(valid_data),
+                        "min": min_val,
+                        "max": max_val,
                         "std_dev": np.std(valid_data),
                     }
                 else:
@@ -559,10 +689,25 @@ def calculate_image_statistics(file_path, values_to_ignore=None, window_size=64,
                 band_stats.append(stats)
             return band_stats
 
-        windows_sampled = 0
-        band_aggregates = {band: [] for band in range(1, src.count + 1)}
+        # If the image is smaller than 2000x2000, process the whole image
+        if width * height <= 2000 * 2000:
+            return calc_on_everything()
 
+        windows_sampled = 0
+        band_aggregates: Dict[int, List[Union[float, int]]] = {}
+        i = 1
+        for band_idx in range(1, src.count + 1):
+            if band_idx - 1 in ignore_bands_indices:
+                continue
+            band_aggregates[i] = []
+            i += 1
+
+        fails = 0
         while windows_sampled < min_windows:
+            if fails > 100:
+                logger.warning(
+                    "Too many failed windows for caluclating image statistics. Calculating on whole image instead.")
+                return calc_on_everything()
             # Randomly pick a top-left corner for the window
             row_start = np.random.randint(0, height - window_size)
             col_start = np.random.randint(0, width - window_size)
@@ -572,7 +717,10 @@ def calculate_image_statistics(file_path, values_to_ignore=None, window_size=64,
             # Read the window for each band
             valid_window = True
             window_data = {}
+            i = 1
             for band_idx in range(1, src.count + 1) if mode == "ms" else range(1, 4):
+                if band_idx - 1 in ignore_bands_indices:
+                    continue
                 band = src.read(band_idx, window=window).astype(float)
                 # Mask out bad values
                 mask = (np.isnan(band) | np.isin(band, values_to_ignore))
@@ -581,8 +729,12 @@ def calculate_image_statistics(file_path, values_to_ignore=None, window_size=64,
 
                 if bad_pixel_ratio > 0.05:  # Exclude windows with >5% bad values
                     valid_window = False
+                    logger.info(
+                        f"Window {windows_sampled} has too many bad pixels ({bad_pixel_ratio:.2f}). Skipping...")
+                    fails += 1
                     break
-                window_data[band_idx] = valid_pixels
+                window_data[i] = valid_pixels
+                i += 1
 
             if valid_window:
                 for band_idx, valid_pixels in window_data.items():
@@ -591,13 +743,14 @@ def calculate_image_statistics(file_path, values_to_ignore=None, window_size=64,
 
         # Compute statistics for each band
         band_stats = []
-        for band_idx in range(1, src.count + 1) if mode == "ms" else range(1, 4):
+        for band_idx in range(1, len(band_aggregates) + 1) if mode == "ms" else range(1, 4):
             valid_data = np.array(band_aggregates[band_idx])
             if valid_data.size > 0:
+                min_val, max_val = np.percentile(valid_data, [1, 99])
                 stats = {
                     "mean": np.mean(valid_data),
-                    "min": np.min(valid_data),
-                    "max": np.max(valid_data),
+                    "min": min_val,
+                    "max": max_val,
                     "std_dev": np.std(valid_data),
                 }
             else:
@@ -629,6 +782,7 @@ def tile_data(
     random_subset: int = -1,
     additional_nodata: List[Any] = [],
     overlapping_tiles: bool = False,
+    ignore_bands_indices: List[int] = [],
 ) -> None:
     """Tiles up orthomosaic and corresponding crowns (if supplied) into training/prediction tiles.
 
@@ -656,6 +810,7 @@ def tile_data(
     Returns:
         None
     """
+
     mask_gdf: gpd.GeoDataFrame = None
     if mask_path is not None:
         mask_gdf = gpd.read_file(mask_path)
@@ -667,11 +822,14 @@ def tile_data(
 
     tile_coordinates = _calculate_tile_placements(img_path, buffer, tile_width, tile_height, crowns, tile_placement,
                                                   overlapping_tiles)
-    image_statistics = calculate_image_statistics(img_path, values_to_ignore=additional_nodata, mode=mode)
+    image_statistics = calculate_image_statistics(img_path,
+                                                  values_to_ignore=additional_nodata,
+                                                  mode=mode,
+                                                  ignore_bands_indices=ignore_bands_indices)
 
     tile_args = [
         (img_path, out_dir, buffer, tile_width, tile_height, dtype_bool, minx, miny, crs, tilename, crowns, threshold,
-         nan_threshold, mode, class_column, mask_gdf, additional_nodata, image_statistics)
+         nan_threshold, mode, class_column, mask_gdf, additional_nodata, image_statistics, ignore_bands_indices)
         for minx, miny in tile_coordinates if mask_path is None or (mask_path is not None and mask_gdf.intersects(
             box(minx, miny, minx + tile_width, miny + tile_height)  #TODO maybe add to_crs here
         ).any())
@@ -694,13 +852,310 @@ def tile_data(
                     try:
                         future.result()
                     except Exception as exc:
-                        print(f'Tile generated an exception: {exc}')
+                        logger.exception(f'Tile generated an exception: {exc}')
                     pbar.update(1)
     else:
         for args in tqdm(tile_args):
             process_tile_train_helper(args)
 
     logger.info("Tiling complete")
+
+
+def create_RGB_from_MS(tile_folder_path: Union[str, Path],
+                       out_dir: Union[str, Path, None] = None,
+                       conversion: str = "pca",
+                       memory_limit: float = 3.0) -> None:
+    """
+    Convert a collection of multispectral GeoTIFF tiles into three-band RGB images. By default, uses PCA
+    to reduce all bands to three principal components, or extracts the first three bands if 'first_three'
+    is chosen. The function saves each output as both a three-band GeoTIFF and a PNG preview.
+
+    Args:
+        tile_folder_path (str or Path):
+            Path to the folder containing multispectral .tif files, along with any .geojson, train, or test subdirectories.
+        out_dir (str or Path, optional):
+            Path to the output directory where RGB images will be saved. If None, a default folder with a suffix
+            "_<conversion>-rgb" is created alongside the input tile folder. If `out_dir` already exists and is not empty,
+            we append also append the current date and time to avoid overwriting.
+        conversion (str, optional):
+            The method of converting multispectral imagery to three bands:
+            - "pca": perform a principal-component analysis reduction to three components.
+            - "first-three": simply select the first three bands (i.e., B1 -> R, B2 -> G, B3 -> B).
+        memory_limit (float, optional):
+            Approximate memory limit in gigabytes for loading data to compute PCA.
+            Relevant only if `conversion="pca"`.
+
+    Returns:
+        None
+
+    Raises:
+        ValueError:
+            If no data is found in the tile folder or if an unsupported conversion method is specified.
+        ImportError:
+            If scikit-learn is not installed and `conversion="pca"`.
+        RasterioIOError:
+            If reading any of the .tif files fails.
+    """
+
+    # Ensure we are working with Path objects
+    tile_folder = Path(tile_folder_path).resolve()
+
+    # Determine the default or custom output folder
+    if out_dir is None:
+        # Example: input folder is /home/user/tiles -> out_dir = /home/user/tiles_pca-rgb
+        out_path = tile_folder.parent / f"{tile_folder.name}_{conversion}-rgb"
+    else:
+        out_path = Path(out_dir).resolve()
+        # If user-specified out_dir is non-empty, append the tile_folder name to avoid overwriting
+        if out_path.is_dir() and any(out_path.iterdir()):
+            out_path = out_path / f"{tile_folder.name}_{conversion}-rgb"
+
+    # If the resolved output folder already exists, append a timestamp to avoid overwriting
+    if out_path.exists():
+        out_path = Path(str(out_path) + f"-{datetime.now().strftime('%Y%m%d%H%M%S')}")
+    out_path.mkdir(parents=True, exist_ok=False)
+
+    # Gather a list of all .tif files and shuffle them
+    tif_files = list(tile_folder.glob("*.tif"))
+    random.shuffle(tif_files)
+
+    if not tif_files:
+        raise ValueError(f"No .tif files found in {tile_folder}")
+
+    # ----------------------------------------------------------------------------------------
+    # If conversion == "pca", gather data from the tiles up to the memory limit, compute PCA.
+    # ----------------------------------------------------------------------------------------
+    if conversion == "pca":
+        images = []
+        size_in_gb = 0.0
+
+        # 1. Collect data (up to memory_limit GB) for PCA
+        for tif_file in tqdm(tif_files, desc="Collecting data for PCA"):
+            try:
+                with rasterio.open(tif_file) as src:
+                    data = src.read().reshape(src.count, -1).T  # Shape: (pixels, bands)
+            except RasterioIOError as e:
+                logger.error(f"Failed to read file {tif_file}: {e}")
+                continue
+
+            # Exclude all-zero (nodata) rows to reduce memory usage
+            data_sum = np.sum(data, axis=1)
+            non_zero_mask = data_sum != 0.0
+            filtered_data = data[non_zero_mask]
+            images.append(filtered_data)
+
+            # Track approximate memory usage
+            size_in_gb += filtered_data.nbytes / (1024**3)
+
+            # If we exceed the memory limit, stop collecting
+            if size_in_gb > memory_limit / 2:
+                logger.info(f"Memory limit reached at ~{len(images)} chunks. Proceeding with PCA calculation.")
+                break
+
+        # Make sure we have some data to fit PCA
+        if not images:
+            raise ValueError("No valid data found in the folder for PCA.")
+
+        # 2. Concatenate all non-zero pixel data for PCA
+        images_concatenated = np.concatenate(images, axis=0)
+        del images  # Clean up memory
+
+        # 3. Fit incremental PCA
+        try:
+            from sklearn.decomposition import IncrementalPCA
+        except ImportError:
+            logger.error("scikit-learn is required for PCA conversion. Please install scikit-learn to continue.")
+            raise ImportError("scikit-learn not installed.")
+
+        batch_size = 1_000_000
+        logger.info("Incrementally calculating principal components...")
+        ipca = IncrementalPCA(n_components=3, batch_size=batch_size)
+        ipca_data = ipca.fit_transform(images_concatenated)
+        del images_concatenated  # Freed up once PCA is fit
+
+        # 4. Compute a robust range (1-99 percentile) to map PCA outputs to [1,255]
+        min_vals, max_vals = np.percentile(ipca_data, [1, 99], axis=0)
+        logger.info(f"PCA explained variance ratio: {ipca.explained_variance_ratio_}")
+        del ipca_data  # Freed up once min/max are computed
+
+        # 5. Transform each tile and save as .tif and .png
+        for tif_file in tqdm(tif_files, desc="Applying PCA and saving RGB"):
+            try:
+                with rasterio.open(tif_file) as src:
+                    transform = src.transform
+                    crs = src.crs
+                    out_meta = src.meta.copy()
+                    raw_data = src.read().reshape(src.count, -1).T  # (pixels, bands)
+            except RasterioIOError as e:
+                logger.error(f"Failed to read file {tif_file}: {e}")
+                continue
+
+            width, height = src.width, src.height
+            data_sum = np.sum(raw_data, axis=1)
+            zero_mask = (data_sum == 0.0)
+
+            # Project the tile's data into the PCA components
+            transformed = ipca.transform(raw_data).astype(np.float32)
+            # Rescale to [1,255]
+            transformed = (transformed - min_vals) / (max_vals - min_vals) * 254.0 + 1.0
+            transformed = np.clip(transformed, 1.0, 255.0)
+
+            # Reinstate nodata=0 for zero rows
+            transformed[zero_mask] = 0.0
+
+            # Reshape back into (bands=3, height, width)
+            transformed = transformed.T.reshape(3, height, width)
+
+            # Optional reorder if you want IPCA dimension #1 as R, #2 as G, #3 as B.
+            # The snippet below swaps them to [G, R, B], but feel free to remove or alter.
+            transformed = transformed[[1, 0, 2], :, :]
+
+            # Update meta for writing out
+            out_meta.update({
+                "nodata": 0.0,
+                "dtype": "float32",
+                "count": 3,
+                "width": width,
+                "height": height,
+                "transform": transform,
+                "crs": crs
+            })
+
+            # Write the GeoTIFF
+            output_tif = out_path / tif_file.name
+            with rasterio.open(output_tif, "w", **out_meta) as dest:
+                dest.write(transformed)
+
+            # Write the PNG (we must convert shape to (H, W, 3) and then to uint8)
+            output_png = out_path / f"{tif_file.stem}.png"
+            png_ready = np.moveaxis(transformed, 0, -1).astype(np.uint8)  # (H, W, 3)
+            cv2.imwrite(str(output_png), cv2.cvtColor(png_ready, cv2.COLOR_RGB2BGR))
+
+    elif conversion == "first-three":
+        # ----------------------------------------------------------------------------------------
+        # If conversion == "first_three", simply take the first 3 bands and save them as RGB.
+        # ----------------------------------------------------------------------------------------
+        for tif_file in tqdm(tif_files, desc="Selecting first three bands"):
+            try:
+                with rasterio.open(tif_file) as src:
+                    out_meta = src.meta.copy()
+                    # Read only the first three bands (or fewer if the file has < 3 bands)
+                    data = src.read(indexes=[1, 2, 3])
+                    if np.nanmax(data) > 255:
+                        logger.exception(
+                            "The input folder seems to be an RGB folder and you are taking the first three bands. This will not change the output. Did you choose the wrong folder? Aborting."
+                        )
+                        return
+            except RasterioIOError as e:
+                logger.error(f"Failed to read file {tif_file}: {e}")
+                continue
+
+            # If the file has fewer than 3 bands, we can pad the missing bands with zeros
+            if data.shape[0] < 3:
+                raise ValueError(f"File {tif_file} has fewer than 3 bands.")
+
+            # Update meta to reflect 3 bands, 8-bit
+            out_meta.update({
+                "count": 3,
+            })
+
+            # Write out the new GeoTIFF
+            output_tif = out_path / tif_file.name
+            with rasterio.open(output_tif, 'w', **out_meta) as dest:
+                dest.write(data)
+
+            # Write out the PNG (shape must be (H, W, 3))
+            output_png = out_path / f"{tif_file.stem}.png"
+            # Move axis from (bands, H, W) -> (H, W, bands)
+            png_ready = np.moveaxis(data, 0, -1).astype(np.uint8)
+            # We expect the order to be [band1, band2, band3], so interpret as R,G,B
+            cv2.imwrite(str(output_png), cv2.cvtColor(png_ready, cv2.COLOR_RGB2BGR))
+
+    else:
+        raise ValueError(f"Unsupported conversion method: {conversion}")
+
+    # ------------------------------------------------------------------------------
+    # Copy .geojson files and train/test folders from the source to the out folder
+    # ------------------------------------------------------------------------------
+    for geojson_file in tile_folder.glob("*.geojson"):
+        shutil.copy(str(geojson_file), str(out_path / geojson_file.name))
+
+    # If a 'train' folder exists in the source, copy it to the out_path
+    train_subfolder = tile_folder / "train"
+    if train_subfolder.is_dir():
+        shutil.copytree(str(train_subfolder), str(out_path / "train"))
+
+    # If a 'test' folder exists in the source, copy it to the out_path
+    test_subfolder = tile_folder / "test"
+    if test_subfolder.is_dir():
+        shutil.copytree(str(test_subfolder), str(out_path / "test"))
+
+    # ------------------------------------------------------------------------
+    # Update "imagePath" fields in .geojson to point to new .png (instead of .tif)
+    # ------------------------------------------------------------------------
+    # 1. Collect geojson files directly under out_path
+    direct_geojsons = list(out_path.glob("*.geojson"))
+
+    # 2. Collect geojson files in test subfolder
+    files_in_subdirs = []
+    test_folder = out_path / "test"
+    if test_folder.is_dir():
+        files_in_subdirs.extend(list(test_folder.glob("*.geojson")))
+
+    # 3. Collect geojson files in train/fold_* subfolders
+    train_folder = out_path / "train"
+    if train_folder.is_dir():
+        fold_dirs = list(train_folder.glob("fold_*"))
+        for fold_dir in fold_dirs:
+            if fold_dir.is_dir():
+                files_in_subdirs.extend(list(fold_dir.glob("*.geojson")))
+
+    # Merge all .geojson paths for final processing
+    all_geojsons = direct_geojsons + files_in_subdirs
+
+    pattern = r'"imagePath":\s*"([^"]+)"'
+    for file_path in tqdm(all_geojsons, desc="Updating 'imagePath' in GeoJSONs"):
+        file_path = file_path.resolve()
+        with open(file_path, 'r') as f:
+            content = f.read()
+
+        match = re.search(pattern, content)
+        if match:
+            old_image_path = match.group(1)
+            old_image_filename = Path(old_image_path).name
+            # Replace '.tif' with '.png' if it exists in the name
+            new_image_filename = old_image_filename.replace('.tif', '.png')
+            new_image_path = (out_path / new_image_filename).as_posix()
+
+            # Update the content with the new path
+            new_content = re.sub(pattern, f'"imagePath": "{new_image_path}"', content)
+
+            # Overwrite the geojson file with the updated image path
+            with open(file_path, 'w') as f:
+                f.write(new_content)
+        else:
+            logger.info(f"No 'imagePath' found in {file_path.name}, skipping.")
+
+    # -------------------------------------------------------------------------
+    # Optional verification step: check that .geojson files in subfolders match
+    # any corresponding file in the main directory
+    # -------------------------------------------------------------------------
+    for sub_file in tqdm(files_in_subdirs, desc="Verifying .geojson files in subfolders"):
+        sub_file_name = sub_file.name
+        # Construct the path it might have in the main out_path
+        expected_file = out_path / sub_file_name
+        if not expected_file.is_file():
+            logger.warning(f"Missing .geojson file in main out_dir: {expected_file}")
+            continue
+
+        sub_size = os.path.getsize(str(sub_file))
+        main_size = os.path.getsize(str(expected_file))
+        if sub_size != main_size:
+            logger.warning(f"Size mismatch for {sub_file_name}:")
+            logger.warning(f" - Size in subdir: {sub_size} bytes")
+            logger.warning(f" - Size in out_dir: {main_size} bytes")
+
+    logger.info("RGB creation from multispectral complete.")
 
 
 def image_details(fileroot):
@@ -781,7 +1236,7 @@ def record_classes(crowns: gpd.GeoDataFrame, out_dir: str, column: str = 'status
     else:
         raise ValueError("Unsupported save format. Use 'json' or 'pickle'.")
 
-    print(f"Classes saved as {save_format} file: {class_to_idx}")
+    logger.info(f"Classes saved as {save_format} file: {class_to_idx}")
 
 
 def to_traintest_folders(  # noqa: C901
