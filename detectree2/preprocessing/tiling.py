@@ -5,6 +5,7 @@ of models and making landscape predictions.
 """
 
 import concurrent.futures
+import glob
 import json
 import logging
 import math
@@ -269,6 +270,10 @@ def process_tile(img_path: str,
         return None
     except Exception as e:
         logger.error(f"Error processing tile {tilename} at ({minx}, {miny}): {e}")
+        #print stacktrace
+        #import traceback
+        #traceback.print_exc()
+
         return None
 
 

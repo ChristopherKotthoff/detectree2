@@ -347,7 +347,8 @@ def clean_crowns(crowns: gpd.GeoDataFrame,
                  iou_threshold: float = 0.7,
                  confidence: float = 0.2,
                  area_threshold: float = 2,
-                 field: str = "Confidence_score") -> gpd.GeoDataFrame:
+                 field: str = "Confidence_score",
+                 verbose: bool = True) -> gpd.GeoDataFrame:
     """Clean overlapping crowns.
 
     Outputs can contain highly overlapping crowns including in the buffer region.
@@ -369,16 +370,22 @@ def clean_crowns(crowns: gpd.GeoDataFrame,
     # Filter any rows with empty or invalid geometry
     crowns = crowns[~crowns.is_empty & crowns.is_valid]
 
+
+    # Filter remaining crowns based on confidence score
+    if confidence != 0:
+        crowns = crowns[crowns[field] > confidence]
+
     # Filter any rows with polgon of less than 1m2 as these are likely to be artifacts
     crowns = crowns[crowns.area > area_threshold]
 
     crowns.reset_index(drop=True, inplace=True)
 
     cleaned_crowns = []
-    print(f"Cleaning {len(crowns)} crowns")
+    if verbose:
+        print(f"Cleaning {len(crowns)} crowns")
 
     for index, row in crowns.iterrows():
-        if index % 1000 == 0:
+        if verbose and index % 1000 == 0:
             print(f"{index} / {len(crowns)} crowns cleaned")
 
         intersecting_rows = crowns[crowns.intersects(shape(row.geometry))]
@@ -409,9 +416,6 @@ def clean_crowns(crowns: gpd.GeoDataFrame,
     else:
         crowns_out = crowns_out.set_crs(crowns.crs)
 
-    # Filter remaining crowns based on confidence score
-    if confidence != 0:
-        crowns_out = crowns_out[crowns_out[field] > confidence]
 
     return crowns_out.reset_index(drop=True)
 

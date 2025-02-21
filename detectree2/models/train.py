@@ -131,6 +131,9 @@ class FlexibleDatasetMapper(DatasetMapper):
             img = aug_input.image
 
             dataset_dict["image"] = torch.as_tensor(np.ascontiguousarray(img.transpose(2, 0, 1)))
+            #assert that image contains neiher nan nor inf
+            if torch.isnan(dataset_dict["image"]).any() or torch.isinf(dataset_dict["image"]).any():
+                raise ValueError(f"Image contains nan or inf values: {dataset_dict['file_name']}")
 
             # Handle semantic segmentation if present
             if "sem_seg_file_name" in dataset_dict:
@@ -146,6 +149,8 @@ class FlexibleDatasetMapper(DatasetMapper):
             if "annotations" in dataset_dict:
                 # Apply the transformations to the annotations
                 self._transform_annotations(dataset_dict, transforms, img.shape[:2])
+                if torch.isnan(dataset_dict["image"]).any() or torch.isinf(dataset_dict["image"]).any():
+                    raise ValueError(f"Image contain nan or inf values after transform: {dataset_dict['file_name']}")
 
             return dataset_dict
 
@@ -664,11 +669,11 @@ class MyTrainer(DefaultTrainer):
 
             if size:
                 print("ADD RANDOM RESIZE WITH SIZE = ", size)
-                augmentations.append(T.ResizeScale(0.6, 1.4, size, size))
+                augmentations.append(T.ResizeScale(0.7, 1.3, size, size))
             else:
                 raise ValueError("Failed to determine image size for random resize")
         elif cfg.RESIZE == "rand_fixed":
-            augmentations.append(T.ResizeScale(0.6, 1.4, 1000, 1000))
+            augmentations.append(T.ResizeScale(0.7, 1.3, 1000, 1000))
 
         return build_detection_train_loader(
             cfg,

@@ -64,16 +64,16 @@ def predict_on_data(
     for i, d in enumerate(dataset_dicts[:num_to_pred], start=1):
         file_name = d["file_name"]
         file_ext = os.path.splitext(file_name)[1].lower()
-        if file_ext == ".png":
+        if False:#file_ext == ".png":
             # RGB image, read with cv2
             img = cv2.imread(file_name)
             if img is None:
                 print(f"Failed to read image {file_name} with cv2.")
                 continue
-        elif file_ext == ".tif":
+        elif True:#file_ext == ".tif":
             # Multispectral image, read with rasterio
-            with rasterio.open(file_name) as src:
-                img = src.read()
+            with rasterio.open(file_name.replace(".png",".tif")) as src:
+                img = src.read().astype(np.uint8)
                 # Transpose to match expected format (H, W, C)
                 img = np.transpose(img, (1, 2, 0))
         else:
