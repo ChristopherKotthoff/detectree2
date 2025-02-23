@@ -1003,7 +1003,7 @@ def setup_cfg(
         imgmode: image mode (rgb or multispectral)
         num_bands: number of bands in the image
         class_mapping_file: path to class mapping file
-        visualize_training: whether to visualize training. Images can also be accessed via TensorBoard
+        visualize_training: whether to visualize training. Images can be accessed via TensorBoard
     """
 
     # Load the class mapping if provided
