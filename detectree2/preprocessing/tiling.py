@@ -199,7 +199,7 @@ def process_tile(img_path: str,
                     unioned_crowns = overlapping_crowns.union_all()
                 else:
                     unioned_crowns = overlapping_crowns.unary_union
-                convex_mask_tif = rasterio.features.geometry_mask([unioned_crowns.convex_hull.buffer(5)],
+                convex_mask_tif = rasterio.features.geometry_mask([unioned_crowns.convex_hull.buffer(3)],
                                                                   transform=out_transform,
                                                                   invert=True,
                                                                   out_shape=(out_img.shape[1], out_img.shape[2]))
@@ -224,8 +224,16 @@ def process_tile(img_path: str,
                 )
                 return None
 
+            # rescale image to 1-255 (0 is reserved for nodata)
+            min_vals, max_vals = np.percentile(
+                out_img.reshape(3, -1)[:, ~nan_mask.reshape(-1).astype(bool)], [0.2, 99.8])
+
+            out_img = (out_img - min_vals) / (max_vals - min_vals) * 254 + 1
+
             # Apply nan mask
             out_img[np.broadcast_to((nan_mask == 1)[None, :, :], out_img.shape)] = 0
+
+            out_img = np.clip(out_img, 0, 255)
 
             dtype, nodata = dtype_map.get(out_img.dtype, (None, None))
             if dtype is None:
@@ -249,20 +257,12 @@ def process_tile(img_path: str,
             r, g, b = out_img[0], out_img[1], out_img[2]
             rgb = np.dstack((b, g, r))  # Reorder for cv2 (BGRA)
 
-            # Rescale to 0-255 if necessary
-            if np.nanmax(g) > 255:
-                rgb_rescaled = rgb / 65535 * 255
-            else:
-                rgb_rescaled = rgb
-
-            np.clip(rgb_rescaled, 0, 255, out=rgb_rescaled)
-
-            cv2.imwrite(str(out_path_root.with_suffix(".png").resolve()), rgb_rescaled.astype(np.uint8))
+            cv2.imwrite(str(out_path_root.with_suffix(".png").resolve()), rgb.astype(np.uint8))
 
             if overlapping_crowns is not None:
-                return data, out_path_root, overlapping_crowns, minx, miny, buffer
+                return out_transform, out_path_root, overlapping_crowns, minx, miny, buffer
 
-            return data, out_path_root, None, minx, miny, buffer
+            return out_transform, out_path_root, None, minx, miny, buffer
 
     except RasterioIOError as e:
         logger.error(f"RasterioIOError while applying mask {coords}: {e}")
@@ -270,6 +270,37 @@ def process_tile(img_path: str,
     except Exception as e:
         logger.error(f"Error processing tile {tilename} at ({minx}, {miny}): {e}")
         return None
+
+
+from skimage.transform import resize
+
+
+def resize_bicubic_antialias_float32(img_chw, target_height, target_width):
+    """
+    Resize a (C, H, W) float32 numpy array (0.0-255.0) to (target_height, target_width) 
+    using bicubic interpolation and anti-aliasing.
+    """
+    # Transpose to (H, W, C) for scikit-image
+    img_hwc = img_chw.transpose(1, 2, 0)
+
+    # Resize with bicubic + anti-aliasing
+    resized_hwc = resize(
+        img_hwc,
+        (target_height, target_width, img_chw.shape[0]),
+        order=3,
+        anti_aliasing=True,  # Gaussian filter to prevent aliasing
+        mode='reflect',
+        preserve_range=True,  # Preserve 0.0–255.0 range (critical for float32)
+        clip=False,  # Do not clip values to 0-1 (since we're preserving range)
+    )
+
+    # Transpose back to (C, H, W) and cast to float32 (no-op if already float32)
+    resized_chw = resized_hwc.transpose(2, 0, 1).astype(np.float32)
+
+    # Optional: Clip to ensure no overshoot (bicubic can produce values outside 0-255)
+    resized_chw = np.clip(resized_chw, 0.0, 255.0)
+
+    return resized_chw
 
 
 def process_tile_ms(img_path: str,
@@ -325,6 +356,9 @@ def process_tile_ms(img_path: str,
                 if mask_gdf is not None:
                     overlapping_crowns = gpd.clip(overlapping_crowns, mask_gdf)
                 if overlapping_crowns.empty or (overlapping_crowns.dissolve().area[0] / geo.area[0]) < threshold:
+                    logger.warning(
+                        f"Skipping tile at ({minx}, {miny}) due to insufficient crown coverage. Threshold: {threshold}, crown coverage: {overlapping_crowns.dissolve().area[0] / geo.area[0]}"
+                    )
                     return None
             else:
                 overlapping_crowns = None
@@ -336,6 +370,7 @@ def process_tile_ms(img_path: str,
             bands_to_read = [
                 i for i in list(range(1, data.count + 1)) if i not in [i + 1 for i in ignore_bands_indices]
             ]
+            bands_to_read = [1, 2, 3]
             out_img, out_transform = mask(data, shapes=coords, nodata=nodata, crop=True, indexes=bands_to_read)
 
             mask_tif = None
@@ -355,7 +390,7 @@ def process_tile_ms(img_path: str,
                     unioned_crowns = overlapping_crowns.union_all()
                 else:
                     unioned_crowns = overlapping_crowns.unary_union
-                convex_mask_tif = rasterio.features.geometry_mask([unioned_crowns.convex_hull.buffer(5)],
+                convex_mask_tif = rasterio.features.geometry_mask([unioned_crowns.convex_hull.buffer(3)],
                                                                   transform=out_transform,
                                                                   invert=True,
                                                                   out_shape=(out_img.shape[1], out_img.shape[2]))
@@ -401,6 +436,19 @@ def process_tile_ms(img_path: str,
                 logger.exception(f"Unsupported dtype: {out_img.dtype}")
 
             out_meta = data.meta.copy()
+
+            size_h = out_img.shape[1]
+            size_w = out_img.shape[2]
+            if size_h > 1300 and size_w > 1300:
+                out_img = resize_bicubic_antialias_float32(out_img, 1300, 1300)  # downsize to 1300 1300
+                out_transform = rasterio.Affine(out_transform.a * size_w / 1300, out_transform.b, out_transform.c,
+                                                out_transform.d, out_transform.e * size_h / 1300, out_transform.f)
+                out_meta.update({
+                    "compress": "lzw",
+                    "predictor": 3,  # Float=3, integer=2
+                    "tiled": True,  # Required for proper LZW optimization
+                })
+
             out_meta.update({
                 "driver": "GTiff",
                 "height": out_img.shape[1],
@@ -417,13 +465,22 @@ def process_tile_ms(img_path: str,
 
             # Uncomment, if pngs of the first three channels of the ms image are needed
             # r, g, b = out_img[0], out_img[1], out_img[2]
-            # rgb = np.dstack((b, g, r)).astype(np.uint8)  # Reorder for cv2 (BGRA)
-            # cv2.imwrite(str(out_path_root.with_suffix(".png").resolve()), rgb)
+            # rgb = np.dstack((b, g, r))  # Reorder for cv2 (BGRA)
+            #
+            # # Rescale to 0-255 if necessary
+            # if np.nanmax(g) > 255:
+            #     rgb_rescaled = rgb / 65535 * 255
+            # else:
+            #     rgb_rescaled = rgb
+            #
+            # np.clip(rgb_rescaled, 0, 255, out=rgb_rescaled)
+            #
+            # cv2.imwrite(str(out_path_root.with_suffix(".png").resolve()), rgb_rescaled.astype(np.uint8))
 
             if overlapping_crowns is not None:
-                return data, out_path_root, overlapping_crowns, minx, miny, buffer
+                return out_transform, out_path_root, overlapping_crowns, minx, miny, buffer
 
-            return data, out_path_root, None, minx, miny, buffer
+            return out_transform, out_path_root, None, minx, miny, buffer
 
     except RasterioIOError as e:
         logger.error(f"RasterioIOError while applying mask {coords}: {e}")
@@ -487,13 +544,13 @@ def process_tile_train(
         # logger.warning(f"Skipping tile at ({minx}, {miny}) due to insufficient data.")
         return
 
-    data, out_path_root, overlapping_crowns, minx, miny, buffer = result
+    out_transform, out_path_root, overlapping_crowns, minx, miny, buffer = result
 
     if overlapping_crowns is not None and not overlapping_crowns.empty:
         overlapping_crowns = overlapping_crowns.explode(index_parts=True)
         moved = overlapping_crowns.translate(-minx + buffer, -miny + buffer)
-        scalingx = 1 / (data.transform[0])
-        scalingy = -1 / (data.transform[4])
+        scalingx = 1 / (out_transform[0])
+        scalingy = -1 / (out_transform[4])
         moved_scaled = moved.scale(scalingx, scalingy, origin=(0, 0))
 
         if mode == "rgb":
@@ -634,6 +691,8 @@ def calculate_image_statistics(file_path,
     Returns:
     - List of dictionaries containing statistics for each band.
     """
+
+    return [{"min": 0, "max": 57670}, {"min": 1966, "max": 61602}, {"min": 0, "max": 45219}]
     if values_to_ignore is None:
         values_to_ignore = []
     values_to_ignore.append(65535)
@@ -802,6 +861,16 @@ def tile_data(
     tilename = Path(img_path).stem
     with rasterio.open(img_path) as data:
         crs = data.crs.to_epsg()  # Update CRS handling to avoid deprecated syntax
+        #get bounds of the image
+        minx, miny, maxx, maxy = data.bounds
+
+    # only keep crowns within the bounds of the image
+    if crowns is not None:
+        logger.info(f"Clipping crowns to image bounds. Previous amount of crowns: {len(crowns)}")
+        # remove all geometries from the geopandas dataframe that are not overlapping with the image bounds
+        crowns = crowns[crowns.geometry.intersects(box(minx, miny, maxx, maxy))]
+
+        logger.info(f"New amount of crowns: {len(crowns)}")
 
     tile_coordinates = _calculate_tile_placements(img_path, buffer, tile_width, tile_height, crowns, tile_placement,
                                                   overlapping_tiles)
@@ -829,7 +898,7 @@ def tile_data(
 
     if multithreaded:
         total_tiles = len(tile_args)
-        with concurrent.futures.ProcessPoolExecutor() as executor:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=12) as executor:
             futures = [executor.submit(process_tile_train_helper, arg) for arg in tile_args]
             with tqdm(total=total_tiles) as pbar:
                 for future in concurrent.futures.as_completed(futures):
@@ -959,8 +1028,13 @@ def create_RGB_from_MS(tile_folder_path: Union[str, Path],
 
         # 4. Compute a robust range (1-99 percentile) to map PCA outputs to [1,255]
         min_vals, max_vals = np.percentile(ipca_data, [1, 99], axis=0)
-        logger.info(f"PCA explained variance ratio: {ipca.explained_variance_ratio_}")
+        logger.info(f"PCA explained variance ratio: {ipca.explained_variance_ratio_}"
+                    )  # TODO ADD STD DIVISION ##############################################################
         del ipca_data  # Freed up once min/max are computed
+
+        import pickle
+        with open("/home/ck690/pca_vectors.pkl", "rb") as f:
+            ipca, mean, std, min_vals, max_vals = pickle.load(f)
 
         # 5. Transform each tile and save as .tif and .png
         for tif_file in tqdm(tif_files, desc="Applying PCA and saving RGB"):
@@ -979,7 +1053,7 @@ def create_RGB_from_MS(tile_folder_path: Union[str, Path],
             zero_mask = (data_sum == 0.0)
 
             # Project the tile's data into the PCA components
-            transformed = ipca.transform(raw_data).astype(np.float32)
+            transformed = ipca.transform((raw_data - mean) / std).astype(np.float32)
             # Rescale to [1,255]
             transformed = (transformed - min_vals) / (max_vals - min_vals) * 254.0 + 1.0
             transformed = np.clip(transformed, 1.0, 255.0)
@@ -1147,6 +1221,101 @@ def create_RGB_from_MS(tile_folder_path: Union[str, Path],
     logger.info("RGB creation from multispectral complete.")
 
 
+def create_rotated_multiples(folder_path: str, out_dir: str, angle: int = 90):
+    try:
+        from shapely import affinity
+        from scipy.ndimage import rotate as ndrotate
+    except:
+        raise ImportError("Please install shapely and scipy to use this function")
+
+    # folder_path and out_dir should probably not be the same.
+
+    # get list of all .tif files in the folder
+    tif_files = sorted(list(Path(folder_path).glob("*.tif")))
+    # get list of all .png files in the folder
+    png_files = sorted(list(Path(folder_path).glob("*.png")))
+    # get list of all .geojson files in the folder
+    geojson_files = sorted(list(Path(folder_path).glob("*.geojson")))
+
+    only_from_folder = "/home/ck690/rds/hpc-work/data/RGBMS/tilesNonWeb4567NEWCl_100_0_0.001/train/fold_5"
+    relevant_files = sorted([str(x.stem) for x in list(Path(only_from_folder).glob("*.geojson"))])
+
+    tif_files = [x for x in tif_files if str(x.stem) in relevant_files]
+    png_files = [x for x in png_files if str(x.stem) in relevant_files]
+    geojson_files = [x for x in geojson_files if str(x.stem) in relevant_files]
+
+    # create out_dir if it does not exist
+    os.makedirs(out_dir, exist_ok=True)
+    # Rotate all .tif files using rasterio
+
+    print("Rotating .tif files")
+    for tif_file in tqdm(tif_files):
+        with rasterio.open(tif_file) as src:
+            arr = src.read()
+            meta = src.meta.copy()
+            rotation_order = 0 if angle % 90 == 0 else 3
+            rotated_arr = arr.copy()
+            for i in range(arr.shape[0]):
+                rotated_arr[i] = ndrotate(arr[i], angle, reshape=False, cval=0, order=rotation_order)
+        new_filename = str(tif_file.name).split("_")[0] + "-rotated" + str(angle) + "_" + "_".join(
+            str(tif_file.name).split("_")[1:])
+        with rasterio.open(Path(out_dir, new_filename), "w", **meta) as dst:
+            dst.write(rotated_arr)
+
+    # Rotate all .png files
+    if len(png_files) > 0:
+        print("Rotating .png files")
+    else:
+        print("No .png files found. This is correct if you are rotating multispectral data.")
+    for png_file in tqdm(png_files):
+        img = cv2.imread(str(png_file), cv2.IMREAD_UNCHANGED)
+        h, w = img.shape[:2]
+        center = (w / 2, h / 2)
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        interpolation = cv2.INTER_NEAREST if angle % 90 == 0 else cv2.INTER_LINEAR
+        rotated_png = cv2.warpAffine(img, M, (w, h), flags=interpolation, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        new_filename = str(png_file.name).split("_")[0] + "-rotated" + str(angle) + "_" + "_".join(
+            str(png_file.name).split("_")[1:])
+        cv2.imwrite(str(Path(out_dir, new_filename)), rotated_png)
+
+    # Rotate all .geojson files using GeoPandas
+    print("Rotating .geojson files")
+    for geojson_file in tqdm(geojson_files):
+        matching_tif = Path(folder_path, geojson_file.stem + ".tif")
+        if not matching_tif.exists():
+            continue
+        with rasterio.open(matching_tif) as src:
+            width, height = src.width, src.height
+            cx, cy = src.width / 2, src.height / 2
+        gdf = gpd.read_file(geojson_file)
+        gdf["geometry"] = gdf["geometry"].apply(
+            lambda geom: affinity.rotate(geom, angle, origin=(cx, cy), use_radians=False))
+
+        # intersect new geometry with window of height and width
+        gdf["geometry"] = gdf["geometry"].apply(lambda geom: geom.intersection(box(0, 0, width, height)))
+        #remove geometries that are empty
+        gdf = gdf[~gdf.is_empty]
+
+        new_filename = str(geojson_file.name).split("_")[0] + "-rotated" + str(angle) + "_" + "_".join(
+            str(geojson_file.name).split("_")[1:])
+        new_file = Path(out_dir, new_filename)
+        gdf.to_file(new_file, driver="GeoJSON")
+
+        with open(geojson_file, "r") as f:
+            old_gjson = json.load(f)
+
+        if old_gjson["imagePath"].endswith(".png"):
+            impath = {"imagePath": new_file.with_suffix(".png").as_posix()}
+        elif old_gjson["imagePath"].endswith(".tif"):
+            impath = {"imagePath": new_file.with_suffix(".tif").as_posix()}
+
+        with open(new_file, "r") as f:
+            new_gjson = json.load(f)
+            new_gjson.update(impath)
+        with open(new_file, "w") as f:
+            json.dump(new_gjson, f)
+
+
 def image_details(fileroot):
     """Take a filename and split it up to get the coordinates, tile width and the buffer and then output box structure.
 
@@ -1226,6 +1395,41 @@ def record_classes(crowns: gpd.GeoDataFrame, out_dir: str, column: str = 'status
         raise ValueError("Unsupported save format. Use 'json' or 'pickle'.")
 
     logger.info(f"Classes saved as {save_format} file: {class_to_idx}")
+
+
+def get_class_distribution(tiles_path: str, validation_fold=-1) -> Dict[str, int]:
+    """Count the number of times each class appears in the specified tiles directory's GeoJSON files.
+        If validation_fold is specified, tiles from that folder will be ignored.
+    """
+    from collections import defaultdict
+    import glob
+    class_counts = defaultdict(int)
+
+    # Construct the pattern for file search, using proper path joining
+    search_pattern = os.path.join(tiles_path, "train", "fold_*", "*.geojson")
+    geojson_paths = glob.glob(search_pattern)
+
+    # Exclude files from the validation fold if specified
+    if validation_fold >= 0:
+        fold_to_exclude = f"fold_{validation_fold}"
+        geojson_paths = filter(lambda p: fold_to_exclude not in p, geojson_paths)
+
+    for file_path in geojson_paths:
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)  # Load JSON data
+                # Ensure it has the expected "features" key
+                if "features" in data and isinstance(data["features"], list):
+                    for feature in data["features"]:
+                        properties = feature.get("properties", {})
+                        status = properties.get("status")
+                        if status:  # Only count non-null statuses
+                            class_counts[status] += 1
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"Error reading {file_path}: {e}")
+    # order by value
+    class_counts = dict(sorted(class_counts.items(), key=lambda item: item[1], reverse=False))
+    return dict(class_counts)  # Convert defaultdict to a regular dict
 
 
 def to_traintest_folders(  # noqa: C901

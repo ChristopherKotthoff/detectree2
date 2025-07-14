@@ -51,6 +51,27 @@ from detectron2.utils.visualizer import ColorMode, Visualizer
 from detectree2.models.outputs import clean_crowns
 from detectree2.preprocessing.tiling import load_class_mapping
 
+from detectron2.layers.wrappers import Conv2d
+import numpy as np
+import torch
+from detectron2.evaluation import DatasetEvaluator
+from detectron2.structures import Boxes, pairwise_iou
+from sklearn.metrics import accuracy_score, confusion_matrix
+from detectron2.evaluation import inference_on_dataset
+import numpy as np
+import torch
+from detectron2.evaluation import DatasetEvaluator
+from detectron2.structures import Boxes, pairwise_iou
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score
+)
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 
 class FlexibleDatasetMapper(DatasetMapper):
     """
@@ -130,6 +151,8 @@ class FlexibleDatasetMapper(DatasetMapper):
             aug_input = T.AugInput(img)
             transforms = self.augmentations(aug_input)  # Apply the augmentations
             img = aug_input.image
+            if len(img.shape) == 2:
+                img = img[:, :, np.newaxis]
 
             dataset_dict["image"] = torch.as_tensor(np.ascontiguousarray(img.transpose(2, 0, 1)))
 
@@ -207,6 +230,9 @@ class LossEvalHook(HookBase):
         total = len(self._data_loader)
         num_warmup = min(5, total - 1)
 
+        if self.trainer._last_eval_results is None:
+            raise ValueError("No evaluation results available. Please make sure that EvalHJook is being run before this hook.")
+
         start_time = time.perf_counter()
         total_compute_time = 0
         losses = []
@@ -238,13 +264,15 @@ class LossEvalHook(HookBase):
         mean_loss = np.mean(losses)
 
         # Calculate the average AP50 across datasets if multiple datasets are used for testing
+        AP = 0
         if len(self.trainer.cfg.DATASETS.TEST) > 1:
             APs = []
             for dataset in self.trainer.cfg.DATASETS.TEST:
-                APs.append(self.trainer.test(self.trainer.cfg, self.trainer.model)[dataset]["segm"]["AP50"])
+                APs.append(self.trainer._last_eval_results[dataset]["segm"]["AP50"])
             AP = sum(APs) / len(APs)
         else:
-            AP = self.trainer.test(self.trainer.cfg, self.trainer.model)["segm"]["AP50"]
+            if "segm" in self.trainer._last_eval_results:
+                AP = self.trainer._last_eval_results["segm"]["AP50"]
 
         print("Av. segm AP50 =", AP)
 
@@ -286,6 +314,9 @@ class LossEvalHook(HookBase):
         next_iter = self.trainer.iter + 1
         is_final = next_iter == self.trainer.max_iter
         if is_final or (self._period > 0 and next_iter % self._period == 0):
+            if is_final and not (self._period > 0 and next_iter % self._period == 0):
+                self.trainer._last_eval_results = self.trainer.test(self.trainer.cfg, self.trainer.model)
+
             self._do_loss_eval()
             # Check if the current AP50 is the best so far
             if self.max_ap < self.trainer.APs[-1]:
@@ -336,6 +367,7 @@ class VisualizerHook(HookBase):
         self.img_per_dataset = img_per_dataset
         self.iter = 0
         self.time_wasted = 0
+        self.logger = logging.getLogger(__name__)
 
     def after_step(self):
         """
@@ -364,11 +396,36 @@ class VisualizerHook(HookBase):
 
                         output = self._model.inference([img_data])[0]
                         img = img_data["image"]
+
+                        if img.shape[0] == 1:
+                            img = img.repeat(3, 1, 1)
+                        ################### TESTING ZONE ######################
+                        if self.trainer.cfg.IMGMODE == "ms" and img.shape[0] == 4:
+                            self.logger.warning("MS with 4 channel image detected in visualizer, performing MS to RGB conversion")
+
+                            X = torch.tensor([[ 0.49700852,  0.69540869, -0.09005879,],
+                                                [ 0.60384953,  0.2834523,   1.00839487,],
+                                                [-0.08460107, -0.14133777, -0.15201134,],
+                                                [ 0.19573193,  0.39180228,  0.21873683,]], dtype=torch.float32, device=img.device)
+                            shape = img.shape
+                            ms_image_reshaped = img.reshape(4, -1)
+
+                            rgb_image_est = X.T @ ms_image_reshaped
+
+                            img = rgb_image_est.reshape(3, shape[1], shape[2])
+
+
+                        #######################################################
+
                         img = nn.functional.interpolate(img.unsqueeze(0),
                                                         size=output["instances"].image_size).squeeze(0)
+
+
                         img = np.transpose(img[:3], (1, 2, 0))
-                        v = Visualizer(img, metadata=MetadataCatalog.get(self.trainer.cfg.DATASETS.TEST[0]), scale=1)
-                        #v = v.draw_instance_predictions(output['instances'][output['instances'].scores > 0.5].to("cpu"))
+                        if self.trainer.cfg.IMGMODE == "rgb" and img.shape[0] != 7:
+                            img[:,:,:] = img[:,:,[2,1,0]]
+
+                        v = Visualizer(img, metadata=MetadataCatalog.get(self.trainer.cfg.DATASETS.TEST[0]), scale=1) # clipped and converted in Visualizer constructor
 
                         masks = output["instances"].pred_masks.to("cpu").numpy()
                         scores = output["instances"].scores.to("cpu").numpy()
@@ -389,16 +446,11 @@ class VisualizerHook(HookBase):
                                                geometry=geoms,
                                                crs="EPSG:3857")
 
-                        gdf = clean_crowns(gdf, iou_threshold=0.3, confidence=0.3, area_threshold=0, verbose=False)
+                        gdf = clean_crowns(gdf, iou_threshold=0.3, confidence=0.3, area_threshold=0)#, verbose=False)
 
                         v = v.draw_instance_predictions(output['instances'][list(gdf["indices"])].to("cpu"))
 
-                        image = cv2.cvtColor(v.get_image(), cv2.COLOR_BGR2RGB)
-
-                        if self.trainer.cfg.IMGMODE == "rgb":
-                            image = np.transpose(image.astype("uint8"), (2, 0, 1))
-                        else:  #ms
-                            image = np.transpose(image.astype("uint8"), (2, 0, 1))[[1, 0, 2]]
+                        image = np.transpose(v.get_image().astype("uint8"), (2, 0, 1))
 
                         storage.put_image(f"val/prediction/{img_data['file_name'].split('/')[-1]}", image)
 
@@ -408,6 +460,248 @@ class VisualizerHook(HookBase):
             print("Visualizing sample validation images took", total_time, "seconds")
             storage.put_scalar("time/visualizing_val_imgs", total_time)
             storage.put_scalar("time/visualizing_val_imgs_total", self.time_wasted)
+
+class ClassAccuracyEvaluator(DatasetEvaluator):
+    """
+    1) Filters out predictions below conf_thresh
+    2) Greedily matches GT→pred on IoU ≥ iou_thresh
+    3) Drops unmatched boxes from classification stats, but counts them
+       as false negatives/positives for detection stats
+    4) Computes:
+       - Detection: TP, FP, FN, precision, recall, F1
+       - Classification (on matched pairs): accuracy, precision, recall,
+         F1 (macro) + per‑class precision/recall/F1
+    """
+
+    def __init__(
+        self,
+        dataset_name: str,
+        metadata,
+        num_classes: int,
+        iou_thresh: float = 0.3,
+        conf_thresh: float = 0.3,
+    ):
+        self.dataset_name = dataset_name
+        self.metadata = metadata
+        self.num_classes = num_classes
+        self.iou_thresh = iou_thresh
+        self.conf_thresh = conf_thresh
+        self.reset()
+
+    def reset(self):
+        # For classification: only matched pairs
+        self._matched_gt = []     # true classes of matched GTs
+        self._matched_pred = []   # predicted classes of matched preds
+        # For detection:
+        self._false_positives = 0
+        self._false_negatives = 0
+
+    @staticmethod
+    def _greedy_match(iou: np.ndarray, thresh: float):
+        """Greedy max‐IoU matching n_gt×n_pred → sets of matched indices."""
+        matched_gt = set()
+        matched_pred = set()
+        iou = iou.copy()
+        while True:
+            g, p = np.unravel_index(np.argmax(iou), iou.shape)
+            if iou[g, p] < thresh:
+                break
+            matched_gt.add(g)
+            matched_pred.add(p)
+            iou[g, :] = -1
+            iou[:, p] = -1
+        return matched_gt, matched_pred
+
+    def process(self, inputs, outputs):
+        """
+        inputs:  list of dicts with ["instances"].gt_boxes, gt_classes
+        outputs: list of dicts with ["instances"].pred_boxes, pred_classes, scores
+        """
+        for inp, out in zip(inputs, outputs):
+            gt_inst = inp.get("instances", None)
+            pred_inst = out.get("instances", None)
+
+            # 1) threshold by conf
+            if pred_inst is not None and hasattr(pred_inst, "scores"):
+                keep = pred_inst.scores >= self.conf_thresh
+                pred_inst = pred_inst[keep]
+
+            has_gt = gt_inst is not None and len(gt_inst) > 0
+            has_pred = pred_inst is not None and len(pred_inst) > 0
+
+            # 2a) no GT, some preds → all false positives
+            if not has_gt and has_pred:
+                self._false_positives += len(pred_inst)
+                continue
+
+            # 2b) no preds, some GT → all false negatives
+            if has_gt and not has_pred:
+                n = len(gt_inst)
+                self._false_negatives += n
+                continue
+
+            # 2c) neither → skip
+            if not has_gt and not has_pred:
+                continue
+
+            # 3) both present → compute IoU and match
+            device = pred_inst.pred_boxes.tensor.device
+            gt_boxes = Boxes(gt_inst.gt_boxes.tensor.to(device))
+            pred_boxes = pred_inst.pred_boxes
+            iou = pairwise_iou(gt_boxes, pred_boxes).cpu().numpy()
+
+            gt_cls = gt_inst.gt_classes.cpu().numpy()
+            pred_cls = pred_inst.pred_classes.cpu().numpy()
+
+            m_gt, m_pred = self._greedy_match(iou, self.iou_thresh)
+
+            # record matched pairs
+            for g_idx, p_idx in zip(sorted(m_gt), sorted(m_pred)):
+                self._matched_gt .append(int(gt_cls[g_idx]))
+                self._matched_pred.append(int(pred_cls[p_idx]))
+
+            # unmatched GT → FNs
+            unmatched_gt = set(range(len(gt_cls))) - m_gt
+            self._false_negatives += len(unmatched_gt)
+
+            # unmatched preds → FPs
+            unmatched_pred = set(range(len(pred_cls))) - m_pred
+            self._false_positives += len(unmatched_pred)
+
+    def evaluate(self):
+        """
+        Returns a nested dict:
+        {
+          "Detection": { "TP":…, "FP":…, "FN":…, "Precision":…, "Recall":…, "F1":… },
+          "Classification": {
+             "Accuracy":…, "Precision":…, "Recall":…, "F1":…,
+             "PerClass": {
+               "<cls0>": { "Precision":…, "Recall":…, "F1":… },
+               …
+             }
+          }
+        }
+        """
+        # Detection stats
+        tp = len(self._matched_gt)
+        fp = self._false_positives
+        fn = self._false_negatives
+        det_prec = tp / (tp + fp + 1e-12)
+        det_rec  = tp / (tp + fn + 1e-12)
+        det_f1   = 2 * tp / (2 * tp + fp + fn + 1e-12)
+
+        # Classification stats on matched pairs
+        if tp == 0:
+            # nothing was matched → zero out
+            cls_acc   = 0.0
+            cls_prec  = 0.0
+            cls_rec   = 0.0
+            cls_f1    = 0.0
+            per_class = {
+                name: {"Precision": 0.0, "Recall": 0.0, "F1": 0.0}
+                for name in getattr(self.metadata, "thing_classes", [])
+            }
+        else:
+            y_true = np.array(self._matched_gt,   dtype=int)
+            y_pred = np.array(self._matched_pred, dtype=int)
+            labels = list(range(self.num_classes))
+
+            cls_acc  = accuracy_score(y_true, y_pred)
+            cls_prec = precision_score(
+                y_true, y_pred, labels=labels, average="macro", zero_division=0
+            )
+            cls_rec  = recall_score(
+                y_true, y_pred, labels=labels, average="macro", zero_division=0
+            )
+            cls_f1   = f1_score(
+                y_true, y_pred, labels=labels, average="macro", zero_division=0
+            )
+
+            pr = precision_score(
+                y_true, y_pred, labels=labels, average=None, zero_division=0
+            )
+            rc = recall_score(
+                y_true, y_pred, labels=labels, average=None, zero_division=0
+            )
+            f1 = f1_score(
+                y_true, y_pred, labels=labels, average=None, zero_division=0
+            )
+            class_names = getattr(self.metadata, "thing_classes", [str(i) for i in labels])
+            per_class = {
+                class_names[i]: {
+                    "Precision": float(pr[i]),
+                    "Recall":    float(rc[i]),
+                    "F1":        float(f1[i]),
+                }
+                for i in range(self.num_classes)
+            }
+
+        return {
+            "Detection": {
+                "TP":        int(tp),
+                "FP":        int(fp),
+                "FN":        int(fn),
+                "Precision": float(det_prec),
+                "Recall":    float(det_rec),
+                "F1":        float(det_f1),
+            },
+            "Classification": {
+                "Accuracy":  float(cls_acc),
+                "Precision": float(cls_prec),
+                "Recall":    float(cls_rec),
+                "F1":        float(cls_f1),
+                "PerClass":  per_class,
+            },
+        }
+
+class ClassAccuracyHook(HookBase):
+    """
+    Every eval_period iters (and on final), evaluate the whole
+    data_loader/model with ClassAccuracyEvaluator and write
+    all sub-metrics into trainer.storage under nested keys.
+    """
+    def __init__(self, eval_period: int, model: torch.nn.Module, data_loader):
+        self._period = eval_period
+        self._model = model
+        self._data_loader = data_loader
+        self._logger = logging.getLogger(__name__)
+
+    def after_step(self):
+        next_iter = self.trainer.iter + 1
+        is_final = next_iter == self.trainer.max_iter
+        if (self._period > 0 and next_iter % self._period == 0) or is_final:
+            self._do_eval()
+
+    def _do_eval(self):
+        cfg = self.trainer.cfg
+        test_ds = cfg.DATASETS.TEST
+        if len(test_ds) == 0:
+            raise ValueError("No TEST datasets specified in cfg.DATASETS.TEST")
+        meta = MetadataCatalog.get(test_ds[0])
+        num_cls = len(meta.thing_classes)
+
+        evaluator = ClassAccuracyEvaluator(
+            dataset_name="combined",
+            metadata=meta,
+            num_classes=num_cls,
+            iou_thresh=0.3,
+            conf_thresh=0.3,
+        )
+        self._logger.info(">>> Running ClassAccuracyEvaluator …")
+        results = inference_on_dataset(self._model, self._data_loader, evaluator)
+        storage = self.trainer.storage
+
+        # flatten and store
+        for group, metrics in results.items():
+            for key, val in metrics.items():
+                if isinstance(val, dict):
+                    # per‐class
+                    for cls_name, subm in val.items():
+                        for subk, subv in subm.items():
+                            storage.put_scalar(f"{group}/{key}/{cls_name}/{subk}", subv)
+                else:
+                    storage.put_scalar(f"{group}/{key}", val)
+        return results
 
 
 # See https://jss367.github.io/data-augmentation-in-detectron2.html for data augmentation advice
@@ -493,32 +787,48 @@ class MyTrainer(DefaultTrainer):
             self.start_iter = self.iter + 1
 
         if self.cfg.MODEL.WEIGHTS:
+            # Get some current values
+            assert self.model.backbone.bottom_up.stem.conv1.weight.device == self.model.roi_heads.box_predictor.cls_score.weight.device == self.model.roi_heads.box_predictor.bbox_pred.weight.device == self.model.roi_heads.mask_head.predictor.weight.device, f"Model weights have different devices: {self.model.backbone.bottom_up.stem.conv1.weight.device}, {self.model.roi_heads.box_predictor.cls_score.weight.device}, {self.model.roi_heads.box_predictor.bbox_pred.weight.device}, {self.model.roi_heads.mask_head.predictor.weight.device}"
             device = self.model.backbone.bottom_up.stem.conv1.weight.device
-            req_grad = self.model.backbone.bottom_up.stem.conv1.weight.requires_grad
-            d_type = self.model.backbone.bottom_up.stem.conv1.weight.dtype
 
+            # Load the model weights
             path = self.checkpointer.path_manager.get_local_path(
                 urlparse(self.cfg.MODEL.WEIGHTS)._replace(query="").geturl())
             print("Path to model weights to be loaded: ", path)
-
             if path.endswith(".pth"):
-                checkpoint = torch.load(
-                    path, map_location=torch.device('cpu'))['model']['backbone.bottom_up.stem.conv1.weight'].to(
-                        self.model.backbone.bottom_up.stem.conv1.weight.device)
+                loaded = torch.load(path, map_location=torch.device('cpu'))['model']
+
+                checkpoint_conv1_weight = loaded['backbone.bottom_up.stem.conv1.weight'].to(device)
+                checkpoint_box_predictor_cls_score_weight = loaded['roi_heads.box_predictor.cls_score.weight'].to(device)
+                checkpoint_box_predictor_cls_score_bias = loaded['roi_heads.box_predictor.cls_score.bias'].to(device)
+                checkpoint_box_predictor_bbox_pred_weight = loaded['roi_heads.box_predictor.bbox_pred.weight'].to(device)
+                checkpoint_box_predictor_bbox_pred_bias = loaded['roi_heads.box_predictor.bbox_pred.bias'].to(device)
+                checkpoint_mask_head_predictor_weight = loaded['roi_heads.mask_head.predictor.weight'].to(device)
+                checkpoint_mask_head_predictor_bias = loaded['roi_heads.mask_head.predictor.bias'].to(device)
+
+
             elif path.endswith(".pkl"):
                 with open(path, "rb") as f:
-                    raw_contents = pickle.load(f)
-                    checkpoint = torch.tensor(raw_contents["model"]["backbone.bottom_up.stem.conv1.weight"],
-                                              dtype=d_type,
-                                              device=device,
-                                              requires_grad=req_grad)
+                    raw_contents = pickle.load(f)["model"]
+
+                    checkpoint_conv1_weight = torch.tensor(raw_contents["backbone.bottom_up.stem.conv1.weight"], device=device)
+                    checkpoint_box_predictor_cls_score_weight = torch.tensor(raw_contents["roi_heads.box_predictor.cls_score.weight"], device=device)
+                    checkpoint_box_predictor_cls_score_bias = torch.tensor(raw_contents["roi_heads.box_predictor.cls_score.bias"], device=device)
+                    checkpoint_box_predictor_bbox_pred_weight = torch.tensor(raw_contents["roi_heads.box_predictor.bbox_pred.weight"], device=device)
+                    checkpoint_box_predictor_bbox_pred_bias = torch.tensor(raw_contents["roi_heads.box_predictor.bbox_pred.bias"], device=device)
+                    checkpoint_mask_head_predictor_weight = torch.tensor(raw_contents["roi_heads.mask_head.predictor.weight"], device=device)
+                    checkpoint_mask_head_predictor_bias = torch.tensor(raw_contents["roi_heads.mask_head.predictor.bias"], device=device)
+
             else:
                 raise FileNotFoundError(f"Checkpoint file {path} ending not recognized.")
 
-            input_channels_in_checkpoint = checkpoint.shape[1]
+
+            # Possibly repeat input weights
+            input_channels_in_checkpoint = checkpoint_conv1_weight.shape[1]
             input_channels_in_model = self.model.backbone.bottom_up.stem.conv1.weight.shape[1]
+            print("Input channels in checkpoint: ", input_channels_in_checkpoint)
+            print("Shape in model conv: ", self.model.backbone.bottom_up.stem.conv1.weight.shape)
             if input_channels_in_checkpoint != input_channels_in_model:
-                logger = logging.getLogger("detectree2")
                 if input_channels_in_checkpoint != 3:
                     logger.warning(
                         "Input channel modification only works if checkpoint was trained on RGB images (3 channels). The first three channels will be copied and then repeated in the model."
@@ -526,11 +836,39 @@ class MyTrainer(DefaultTrainer):
                 logger.warning(
                     "Mismatch in input channels in checkpoint and model, meaning fvcommon would not have been able to automatically load them. Adjusting weights for 'backbone.bottom_up.stem.conv1.weight' manually."
                 )
-                with torch.no_grad():
-                    self.model.backbone.bottom_up.stem.conv1.weight[:, :3] = checkpoint[:, :3]
+                #with torch.no_grad():
+                #    self.model.backbone.bottom_up.stem.conv1.weight[:, :3] = checkpoint_conv1_weight[:, :3]
                 multiply_conv1_weights(self.model)
-                self.model.backbone.bottom_up.stem.conv1.weight.to(device)
-                self.model.backbone.bottom_up.stem.conv1.weight.requires_grad = req_grad
+
+            with torch.no_grad():
+                conv1 = self.model.backbone.bottom_up.stem.conv1
+                nn.init.kaiming_normal_(
+                    conv1.weight[:, :input_channels_in_model],  # all 3 input channels for every output channel
+                    mode='fan_out',
+                    nonlinearity='relu')
+
+            print("Shape of conv1 weights after initialization: ", self.model.backbone.bottom_up.stem.conv1.weight.shape)
+            # Possibly repeat class weights
+            '''classes_in_checkpoint = checkpoint_box_predictor_cls_score_weight.shape[0]-1
+            classes_in_model = self.model.roi_heads.box_predictor.cls_score.weight.shape[0]-1
+            if classes_in_checkpoint != classes_in_model:
+                logger.warning(
+                    "Mismatch in classes in checkpoint and model, meaning fvcommon would not have been able to automatically load them. Adjusting weights for 'roi_heads.{box_predictor, mask_head}.*' manually by repeating the weights from the first class."
+                )
+                with torch.no_grad():
+                    self.model.roi_heads.box_predictor.cls_score.weight[:-1] = checkpoint_box_predictor_cls_score_weight[0]
+                    self.model.roi_heads.box_predictor.cls_score.weight[-1:] = checkpoint_box_predictor_cls_score_weight[-1]
+                    self.model.roi_heads.box_predictor.cls_score.bias[:-1] = checkpoint_box_predictor_cls_score_bias[0]
+                    self.model.roi_heads.box_predictor.cls_score.bias[-1:] = checkpoint_box_predictor_cls_score_bias[-1]
+
+
+                    for i in range(classes_in_model):
+                        self.model.roi_heads.box_predictor.bbox_pred.weight[i*4:(i+1)*4, :] = checkpoint_box_predictor_bbox_pred_weight[:4]
+                        self.model.roi_heads.box_predictor.bbox_pred.bias[i*4:(i+1)*4] = checkpoint_box_predictor_bbox_pred_bias[:4]
+
+
+                    self.model.roi_heads.mask_head.predictor.weight[:] = checkpoint_mask_head_predictor_weight[0]
+                    self.model.roi_heads.mask_head.predictor.bias[:] = checkpoint_mask_head_predictor_bias[0]'''
 
     @classmethod
     def build_evaluator(cls, cfg, dataset_name, output_folder=None):
@@ -600,6 +938,15 @@ class MyTrainer(DefaultTrainer):
             )
 
         # Insert the custom LossEvalHook before the last hook (typically the evaluation hook)
+        hooks.insert(
+            -1,
+            ClassAccuracyHook(
+                self.cfg.TEST.EVAL_PERIOD,
+                self.model,
+                build_detection_test_loader(self.cfg, self.cfg.DATASETS.TEST,
+                                            FlexibleDatasetMapper(self.cfg, True, augmentations=augmentations)),
+            ),
+        )
         hooks.insert(
             -1,
             LossEvalHook(
@@ -696,7 +1043,7 @@ class MyTrainer(DefaultTrainer):
         Returns:
             DataLoader: A data loader for the test dataset.
         """
-        return build_detection_test_loader(cfg, dataset_name, mapper=FlexibleDatasetMapper(cfg, is_train=False))
+        return build_detection_test_loader(cfg, dataset_name, mapper=FlexibleDatasetMapper(cfg, is_train=False, augmentations=[T.ResizeShortestEdge([1000, 1000], 1333)]))
 
 
 def get_tree_dicts(directory: str, class_mapping: Optional[Dict[str, int]] = None) -> List[Dict[str, Any]]:
@@ -794,9 +1141,9 @@ def combine_dicts(root_dir: str,
         List of combined dictionaries from the specified directories.
     """
     # Get the list of directories within the root directory
-    train_dirs = [
+    train_dirs = sorted([
         os.path.join(root_dir, dir) for dir in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, dir))
-    ]
+    ])
     # Handle the different modes for combining dictionaries
     if mode == "train":
         # Exclude the validation directory from the list of directories
@@ -857,6 +1204,38 @@ def get_filenames(directory: str):
     return dataset_dicts, mode
 
 
+def create_thing_classes(class_mapping_file):
+    """Create thing classes from class mapping file.
+
+    Args:
+        class_mapping_file: path to class mapping file
+    """
+    class_mapping = load_class_mapping(class_mapping_file)
+
+    # The following code creates the class names. This is done in the case that multiple tree names point to the same index.
+    highest_value = max(class_mapping.values())
+    not_assigned = [i for i in range(highest_value + 1) if i not in class_mapping.values()]
+    if not_assigned:
+        logger.warning(f"Classes {not_assigned} are not assigned in the class mapping file.")
+
+    num_classes = highest_value + 1
+
+    categories = [[] for _ in range(num_classes)]
+    for key, value in class_mapping.items():
+        categories[value].append(key)
+
+    thing_classes = map(lambda x: "-".join([category[:int(len(category)//len(x)+1)] for category in sorted(x)]) if x else "-", categories)
+
+    ret = list(thing_classes)
+
+    if ret != sorted(ret):
+        a = {i:n for i,n in enumerate(ret)}
+        b = {i:n for i,n in enumerate(sorted(ret))}
+        raise ValueError(f"The class names are not sorted anymore after combining. This WILL cause issues with the model. The current index dictionary is {a} but should be {b}. Change the class_mapping file to fix this.")
+
+    return ret
+
+
 def register_train_data(train_location, name: str = "tree", val_fold=None, class_mapping_file=None):
     """Register data for training and (optionally) validation.
 
@@ -870,7 +1249,7 @@ def register_train_data(train_location, name: str = "tree", val_fold=None, class
     class_mapping = None
     if class_mapping_file:
         class_mapping = load_class_mapping(class_mapping_file)
-        thing_classes = list(class_mapping.keys())  # Convert dictionary to list of class names
+        thing_classes = create_thing_classes(class_mapping_file)
         print(f"Class mapping loaded: {class_mapping}")  # Debugging step
     else:
         thing_classes = ["tree"]
@@ -918,7 +1297,6 @@ def remove_registered_data(name="tree"):
         DatasetCatalog.remove(name + "_" + d)
         MetadataCatalog.remove(name + "_" + d)
 
-
 def register_test_data(test_location, name="tree"):
     """Register data for testing.
 
@@ -931,7 +1309,8 @@ def register_test_data(test_location, name="tree"):
     class_mapping = None
     if class_mapping_file:
         class_mapping = load_class_mapping(class_mapping_file)
-        thing_classes = list(class_mapping.keys())  # Convert dictionary to list of class names
+        thing_classes = create_thing_classes(class_mapping_file)
+
         print(f"Class mapping loaded: {class_mapping}")  # Debugging step
     else:
         thing_classes = ["tree"]
@@ -1005,8 +1384,7 @@ def setup_cfg(
 
     # Load the class mapping if provided
     if class_mapping_file:
-        class_mapping = load_class_mapping(class_mapping_file)
-        num_classes = len(class_mapping)  # Set the number of classes based on the mapping
+        num_classes = len(create_thing_classes(class_mapping_file))
     else:
         num_classes = 1  # Default to 1 class if no mapping is provided
 
@@ -1051,6 +1429,10 @@ def setup_cfg(
                                 default_pixel_mean[:num_bands % len(default_pixel_mean)])
         cfg.MODEL.PIXEL_STD = (default_pixel_std * (num_bands // len(default_pixel_std)) +
                                default_pixel_std[:num_bands % len(default_pixel_std)])
+    else:
+        cfg.MODEL.PIXEL_MEAN = cfg.MODEL.PIXEL_MEAN[:num_bands]
+        cfg.MODEL.PIXEL_STD = cfg.MODEL.PIXEL_STD[:num_bands]
+
     if visualize_training:
         cfg.VALIDATION_VIS_PERIOD = eval_period
     else:
@@ -1158,6 +1540,7 @@ def multiply_conv1_weights(model):
         model (torch.nn.Module): The model containing the convolutional layer to modify.
 
     """
+    logger = logging.getLogger(__name__)
     with torch.no_grad():
 
         old_conv = model.backbone.bottom_up.stem.conv1
@@ -1172,18 +1555,39 @@ def multiply_conv1_weights(model):
         new_weights = torch.zeros((out_channels, in_channels, kh, kw), device=device, dtype=dtype)
 
         # Multiply weights round-robin
-        for i in range(in_channels):
-            new_weights[:, i, :, :] = old_weights[:, (i + 1) % 3, :, :] / ((in_channels // 3) +
-                                                                           (1 if i % 3 < in_channels % 3 else 0))
+        if in_channels != 4:
+            for i in range(in_channels):
+                new_weights[:, i, :, :] = old_weights[:, i % 3, :, :] / ((in_channels//3) + (1 if i%3 < in_channels % 3 else 0))
+        else:
+            logger.warning("Using hardcoded weight conversion for input channels. From 3 (B G R) to 4 (G R RE NIR)")
+            reconstruction_matrix = torch.tensor([[-0.25007288,  0.11333805, -0.31423321, -0.49528916],
+                                                [ 0.18962433, -0.62745535,  0.1312957,   0.87373517],
+                                                [ 0.76888997,  1.26346879,  0.89944609,  0.15155282]], device=device, dtype=dtype)
+            oldies = old_weights[:, :3, :, :].permute(1,0,2,3).reshape(3, -1)
+            newies = reconstruction_matrix.T @ oldies
+            newies = newies.reshape(4,64,7,7).permute(1,0,2,3)
+            # save all weights of newies to cleartext file
+            with open("newies.txt", "w") as f:
+                f.write(f"shape: {newies.shape}\n")
+                for i in range(newies.shape[0]):
+                    for j in range(newies.shape[1]):
+                        for k in range(newies.shape[2]):
+                            for l in range(newies.shape[3]):
+                                f.write(f"{newies[i, j, k, l].item()} ")
+                            f.write("\n")
+                        f.write("\n")
+                    f.write("\n")
+                
+            new_weights.copy_(newies)
 
         # Create a fresh Conv2d that has the correct shape
         new_conv = Conv2d(in_channels=in_channels,
-                          out_channels=out_channels,
-                          kernel_size=old_conv.kernel_size,
-                          stride=old_conv.stride,
-                          padding=old_conv.padding,
-                          bias=old_conv.bias,
-                          norm=old_conv.norm)
+                             out_channels=out_channels,
+                             kernel_size=old_conv.kernel_size,
+                             stride=old_conv.stride,
+                             padding=old_conv.padding,
+                             bias=old_conv.bias,
+                             norm=old_conv.norm)
         new_conv.activation = old_conv.activation
 
         # Move the new conv onto the same device just to be sure....
@@ -1234,7 +1638,7 @@ if __name__ == "__main__":
 
     # Register the training and validation datasets using the class mapping
     # If class_mapping_file is not provided, defaults to "tree"
-    register_train_data(train_location, "MyDataset", val_fold=1, class_mapping_file=class_mapping_file)
+    register_train_data(train_location, "MyDataset", val_fold=5, class_mapping_file=class_mapping_file)
 
     # Set up model configuration, using the class mapping to determine the number of classes
     cfg = setup_cfg(

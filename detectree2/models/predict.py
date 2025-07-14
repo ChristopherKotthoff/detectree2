@@ -72,8 +72,8 @@ def predict_on_data(
                 continue
         elif file_ext == ".tif":
             # Multispectral image, read with rasterio
-            with rasterio.open(file_name) as src:
-                img = src.read()
+            with rasterio.open(file_name.replace(".png",".tif")) as src:
+                img = src.read().astype(np.uint8) ################??????????????????
                 # Transpose to match expected format (H, W, C)
                 img = np.transpose(img, (1, 2, 0))
         else:

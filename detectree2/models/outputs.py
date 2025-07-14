@@ -36,8 +36,7 @@ def polygon_from_mask(masked_arr):
     https://github.com/hazirbas/coco-json-converter/blob/master/generate_coco_json.py <-- adapted from here
     """
 
-    contours, _ = cv2.findContours(
-        masked_arr, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(masked_arr, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
     segmentation = []
     for contour in contours:
@@ -124,8 +123,7 @@ def to_eval_geojson(directory=None):  # noqa:N803
                         if epsg == "26917":
                             rescaled_coords.append([x_coord, -y_coord])
                         else:
-                            rescaled_coords.append(
-                                [x_coord, -y_coord + int(img_dict["height"])])
+                            rescaled_coords.append([x_coord, -y_coord + int(img_dict["height"])])
 
                     geofile["features"].append({
                         "type": "Feature",
@@ -142,8 +140,7 @@ def to_eval_geojson(directory=None):  # noqa:N803
             # error appears.
             # print(geofile)
 
-            output_geo_file = os.path.join(
-                directory, img_dict["filename"].replace(".json", "_eval.geojson"))
+            output_geo_file = os.path.join(directory, img_dict["filename"].replace(".json", "_eval.geojson"))
             # print(output_geo_file)
             with open(output_geo_file, "w") as dest:
                 json.dump(geofile, dest)
@@ -344,12 +341,15 @@ def calc_iou(shape1, shape2):
     return iou
 
 
+from tqdm import tqdm
+
+
 def clean_crowns(crowns,
-                iou_threshold= 0.7,
-                confidence= 0.2,
-                area_threshold = 2,
-                field= "Confidence_score",
-                verbose= True) -> gpd.GeoDataFrame:
+                 iou_threshold=0.7,
+                 confidence=0.2,
+                 area_threshold=2,
+                 field="Confidence_score",
+                 verbose=True) -> gpd.GeoDataFrame:
     """
     Clean overlapping crowns by first identifying all candidate overlapping pairs via a spatial join,
     then clustering crowns into connected components (where an edge is added if two crowns have IoU
@@ -400,9 +400,10 @@ def clean_crowns(crowns,
             parent[ry] = rx
 
     # 4. For each candidate pair, compute IoU and, if it exceeds the threshold, merge the groups.
-    for idx, row in tqdm(join.iterrows(), total=len(join), desc="clean_crowns: Processing candidate pairs", smoothing=0, disable=not verbose):
-        i = row.name           # index from left table (crowns)
-        j = row["index_right"] # index from right table (crowns)
+    for idx, row in tqdm(join.iterrows(), total=len(join), desc="clean_crowns: Processing candidate pairs",
+                         smoothing=0):
+        i = row.name  # index from left table (crowns)
+        j = row["index_right"]  # index from right table (crowns)
         # To avoid duplicate work, skip if i and j are already in the same group.
         if find(i) == find(j):
             continue
@@ -426,7 +427,6 @@ def clean_crowns(crowns,
 
     # 7. Assemble the cleaned crowns.
     cleaned_crowns = crowns.loc[selected_indices].copy()
-
 
     return gpd.GeoDataFrame(cleaned_crowns, crs=crowns.crs).reset_index(drop=True)
 
@@ -518,8 +518,7 @@ def average_polygons(polygons, weights=None, num_points=300):
     for i in range(num_points):
         if weights:
             points_at_i = [
-                np.array(poly.exterior.coords[i]) * weight
-                for poly, weight in zip(normalized_polygons, weights)
+                np.array(poly.exterior.coords[i]) * weight for poly, weight in zip(normalized_polygons, weights)
             ]
             avg_point_at_i = sum(points_at_i) / sum(weights)
         else:
@@ -529,10 +528,8 @@ def average_polygons(polygons, weights=None, num_points=300):
     avg_polygon = Polygon(avg_polygon_points)
 
     # Compute the average centroid of the input polygons
-    average_centroid = (
-        np.mean([poly.centroid.x for poly in polygons]),
-        np.mean([poly.centroid.y for poly in polygons])
-    )
+    average_centroid = (np.mean([poly.centroid.x for poly in polygons]), np.mean([poly.centroid.y
+                                                                                  for poly in polygons]))
 
     # Compute the average area of the input polygons
     average_area = np.mean([poly.area for poly in polygons])
@@ -589,9 +586,7 @@ def combine_and_average_polygons(gdfs, iou=0.9):
 
         if len(significant_matches) > 1:
             averaged_polygon = average_polygons(
-                significant_matches,
-                significant_confidences if "Confidence_score" in combined_gdf.columns else None
-            )
+                significant_matches, significant_confidences if "Confidence_score" in combined_gdf.columns else None)
             new_polygons.append(averaged_polygon)
             combined_counts.append(len(significant_matches))
             if confidence is not None:
@@ -628,8 +623,7 @@ def clean_predictions(directory, iou_threshold=0.7):
             crowns = gpd.GeoDataFrame()
 
             for shp in datajson:
-                crown_coords = polygon_from_mask(
-                    mask_util.decode(shp["segmentation"]))
+                crown_coords = polygon_from_mask(mask_util.decode(shp["segmentation"]))
                 if crown_coords == 0:
                     continue
                 rescaled_coords = []
@@ -639,9 +633,14 @@ def clean_predictions(directory, iou_threshold=0.7):
                     x_coord = crown_coords[c]
                     y_coord = crown_coords[c + 1]
                     rescaled_coords.append([x_coord, y_coord])
-                crowns = pd.concat([crowns, gpd.GeoDataFrame({'Confidence_score': shp['score'],
-                                                              'geometry': [Polygon(rescaled_coords)]},
-                                                             geometry=[Polygon(rescaled_coords)])])
+                crowns = pd.concat([
+                    crowns,
+                    gpd.GeoDataFrame({
+                        'Confidence_score': shp['score'],
+                        'geometry': [Polygon(rescaled_coords)]
+                    },
+                                     geometry=[Polygon(rescaled_coords)])
+                ])
 
             crowns = crowns.reset_index().drop('index', axis=1)
             crowns, indices = clean_outputs(crowns, iou_threshold)
@@ -687,11 +686,10 @@ def clean_outputs(crowns: gpd.GeoDataFrame, iou_threshold=0.7):
             intersecting['iou'] = iou
             # Remove those crowns with a poor match
             matches = intersecting[intersecting['iou'] > iou_threshold]
-            matches = matches.sort_values(
-                'Confidence_score', ascending=False).reset_index().drop('index', axis=1)
+            matches = matches.sort_values('Confidence_score', ascending=False).reset_index().drop('index', axis=1)
             # Of the remaining crowns select the crown with the highest confidence
             match = matches.loc[[0]]
-            if match['iou'][0] < 1:   # If the most confident is not the initial crown
+            if match['iou'][0] < 1:  # If the most confident is not the initial crown
                 continue
             else:
                 match = match.drop('iou', axis=1)
